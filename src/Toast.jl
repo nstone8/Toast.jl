@@ -1,6 +1,6 @@
 module Toast
 
-using Hexagons, Delica, Tessen, Unitful, Statistics
+using Hexagons, Delica, Tessen, Unitful, Statistics, Meshes
 import Base:convert
 import Tessen:HatchLine, pointalong, intersections
 
@@ -15,7 +15,6 @@ will be written to `"config.jl"`.
 - dfield: calibrated FOV for the objective being used
 - hbottom: distance from the bottom of the post to the bottom of the beams
 - htop: distance from the bottom of the beams to the top of the bumpers
-- chamferbottom: angle at which the bottoms of the posts should be chamfered
 - chamfertop: angle at which the tops of the posts and beams should be chamfered
 - cutangle: angles at which blocks should be cut to avoid shadowing
 - overlap: amount that neighboring blocks should overlap to ensure they are connected
@@ -43,7 +42,6 @@ function createconfig(filename="config.jl")
         :dfield => 1750u"µm",
         :hbottom => 30u"µm",
         :htop => 70u"µm",
-        :chamferbottom => 0,
         :chamfertop => pi/6,
         :cutangle => pi/6,
         :overlap => 10u"µm",
@@ -77,7 +75,8 @@ function bumperedgecoords(;kwargs...)
     hbottom = kwargs[:hbottom]
     htop = kwargs[:htop]
     chamfertop = kwargs[:chamfertop]
-    chamferbottom = kwargs[:chamferbottom]
+    #I removed this parameter
+    chamferbottom = 0
     wbumper = kwargs[:wbumper]
     fillet = kwargs[:fillet]
     #figuring out how to fillet everything in crossection seems hard enough that I'm just going
@@ -465,6 +464,154 @@ function bumper(path,profile,maxseglength,zstart,zend,dslice,overlap,cutangle)
     end
     #build a superblock
     SuperBlock(blocks...)
+end
+
+"""
+```julia
+post(;kwargs...)
+```
+Build a `Block` representing a triangular
+"""
+function post(;kwargs...)
+    #the z coordinates of our slices
+    zcoords = range(start=zero(kwargs[:hbottom]),
+                    stop=kwargs[:hbottom]+kwargs[:hbeam],
+                    step=kwargs[:dslice])
+    #`lengthpairs` will be a z => sidelength iterator
+    lengthpairs = map(zcoords) do z
+        z => kwargs[:wpost] - (if z < kwargs[:hbottom]
+                                   #we're underneath the beams
+                                   #no undercut
+                                   zero(kwargs[:wpost])
+                               else
+                                   #we're on top of the beams
+                                   #the amount of 'overcut'
+                                   2*(z-kwargs[:hbottom])*tan(kwargs[:chamfertop])
+                               end)
+    end
+
+    #helper function to calculate the degree of fillet (from 0 to 1) for the posts
+    #when z=0, degreefillet(z) = 1 (fully filleted) when z=:hbottom degreefillet(z)=0
+    degreefillet(z) = if z >= kwargs[:hbottom]
+        0
+    else
+        (kwargs[:hbottom] - z)/kwargs[:hbottom]
+    end
+    #radius of the circumscribed circle of a equilateral triangle with a side length of one
+    r = 1/sqrt(3)
+    #radius of the corresponding inscribed circle
+    r_ins = sqrt(3)/6
+    slicepairs = map(lengthpairs) do (z,l)
+        #make the feet rounded in the yz/xz plane in addition to filleting in xy
+        l = 0.9*l*(1 - degreefillet(z))^(1/2) + 0.1*l
+        @show l
+        coords = l .* map((pi/2) .+ [0, 2pi/3, 4pi/3]) do theta
+            r*[cos(theta),sin(theta)]
+        end
+        z => Slice([polycontour(coords,degreefillet(z)*l*r_ins)])
+    end
+    Block(slicepairs...)
+end
+
+function oddqhexcoords(q,r)
+    #just call an odd-r coordinate system with reversed coordinates and then reverse the result
+    map(HexagonOffsetOddR(r,q) |> Hexagons.vertices) do vert
+        reverse(vert) |> collect
+    end
+end
+
+#make wrappers for bridge and post coordinates
+struct PostCoords
+    p
+    lefttilt::Bool
+end
+
+struct BeamCoords
+    p1
+    p2
+end
+
+function isequal(b1::BeamCoords, b2::BeamCoords)
+    (isequal(b1.p1,b2.p1) && isequal(b1.p2,b2.p2)) || (isequal(b1.p2,b2.p1) && isequal(b1.p1,b2.p2))
+end
+
+function mapgeometry(path::Vector{LineEdge},hexsize::Quantity)
+    verts = [1u"μm"*le.p1 for le in path]
+    #build an ngon to represent our area of interest
+    outline = Ngon((Point(v...) for v in verts)...)
+    #start at 0,0 and scan column by column, keep going up until we find a hexagon
+    #where no vertices are in our outline and we have gone up past the furthest in bounds vert
+    #we've ever seen
+    maxy = 0
+    postcoords = []
+    beamcoords = []
+    currentcoords = [0,0]
+    while true #scanning rows
+        #we will use this to look for a column with no in bounds hexagons
+        emptycol = true
+        currentcoords[2] = 0
+        while true #scanning columns
+            theseverts = hexsize * oddqhexcoords(currentcoords...)            
+            if any(Point(v...) in outline for v in theseverts)
+                #this hexagon lies in the outline
+                #make PostCoords and BeamCoords objects
+                for (p,lt) in zip(theseverts,repeat([true,false],3))
+                    thispost = PostCoords(p,lt)
+                    push!(postcoords,thispost)
+                end
+                for i in 1:5
+                    push!(beamcoords,BeamCoords(theseverts[i],theseverts[i+1]))
+                end
+                push!(beamcoords,BeamCoords(theseverts[end],theseverts[1]))
+                emptycol = false
+            else
+                #no vertices lie in the outline, stop if we've gone as far as we ever have
+                if currentcoords[2] >= maxy
+                    maxy = currentcoords[2]
+                    break
+                end
+            end
+            currentcoords += [0,1]
+        end
+        #we're done if this column was empty
+        if emptycol
+            break
+        end
+        currentcoords += [1,0]
+    end
+    #mirror the coords (assuming symmetry around y axis)
+    mirroredpostcoords = [PostCoords(pc.p .* [-1,1], !pc.lefttilt) for pc in postcoords]
+    push!(postcoords,mirroredpostcoords...)
+
+    mirroredbeamcoords = [BeamCoords(bc.p1 .* [-1,1], bc.p2 .* [-1,1]) for bc in beamcoords]
+    push!(beamcoords,mirroredbeamcoords...)
+    
+    #get all the unique posts and beams where at least one coordinate lies inside the outline
+    postcoords = filter(postcoords |> Set |> collect) do pc
+        Point(pc.p...) in outline
+    end
+    beamcoords = filter(beamcoords |> Set |> collect) do bc
+        (Point(bc.p1...) in outline) || (Point(bc.p2...) in outline)
+    end
+    return (posts=postcoords,beams=beamcoords)
+end
+
+function Tessen.offset(path::Vector{<:Tessen.Edge},x::Real)
+    [Tessen.offset(p,x) for p in path]
+end
+
+function postbeamcoords(w,h1,h2,h3,hexsize::Quantity)
+    bumperpath = polycontour(outlineverts(w,h1,h2,h3)*hexsize).edges
+    #get an outline a little bigger than we want
+    outer = Tessen.offset(bumperpath,0.1*hexsize)
+    #and one a little smaller
+    inner = Tessen.offset(bumperpath,-0.1*hexsize)
+    #now get the vertices in each
+    outercoords = mapgeometry(outer,hexsize)
+    innercoords = mapgeometry(inner,hexsize)
+    #the posts in outerverts that aren't in innerverts are our attachment points
+    attachment = setdiff(outercoords.posts,innercoords.posts)
+    return (attachment = attachment, posts = innercoords.posts, beams = innercoords.beams)
 end
 
 end # module Toast
