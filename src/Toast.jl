@@ -1,6 +1,7 @@
 module Toast
 
 using Hexagons, Delica, Tessen, Unitful, Statistics, Meshes
+using LinearAlgebra, Ahmes
 import Base:convert
 import Tessen:HatchLine, pointalong, intersections
 
@@ -36,6 +37,12 @@ will be written to `"config.jl"`.
 - interfacepos: how far into the substrate writing should begin
 - hamscanspeed: scan speed for hammocks
 - hamlaserpower: laser power for hammocks
+- w: Relative width of the scaffold
+- h1: Relative height of the southern portion of the scaffold
+- h2: Relative height of the middle portion of the scaffold
+- h3: Relative height of the northern portion of the scaffold
+- hexsize: Size of component hexagons
+- bumperfillet: Amount to round the corners of the bumper
 """
 function createconfig(filename="config.jl")
     config = """Dict(
@@ -62,7 +69,14 @@ function createconfig(filename="config.jl")
         :stagespeed => 100u"µm/s",
         :interfacepos => 10u"µm",
         :hamscanspeed => 2_000u"µm/s",
-        :hamlaserpower => 50u"mW"
+        :hamlaserpower => 50u"mW",
+        :w => 2,
+        :h1 => 3,
+        :h2 => 5,
+        :h3 => 3,
+        :hexsize => 50u"µm",
+        :bumperfillet => 250u"µm",
+        :bumperseglength => 500u"µm"
     )
     """
     open(filename,"w") do io
@@ -182,7 +196,7 @@ OffsetContour(le::LineEdge,x1,x2) = LineOffsetContour(le,x1,x2)
 
 function centroid(loc::LineOffsetContour)
     #This is the midpoint of an offset line halfway between x1 and x2
-    meanoffset = offset(loc.edge,mean([loc.x1,loc.x2]))
+    meanoffset = Tessen.offset(loc.edge,mean([loc.x1,loc.x2]))
     #get the midpoint
     pointalong(meanoffset,span(meanoffset)/2) * 1u"μm"
 end
@@ -193,7 +207,7 @@ function area(loc::LineOffsetContour)
 end
 
 function getoffsetedges(loc::LineOffsetContour)
-    [offset(loc.edge,x) for x in [loc.x1,loc.x2]]
+    [Tessen.offset(loc.edge,x) for x in [loc.x1,loc.x2]]
 end
 
 struct ArcOffsetContour <: OffsetContour
@@ -205,7 +219,7 @@ end
 OffsetContour(ae::ArcEdge,x1,x2) = ArcOffsetContour(ae,x1,x2)
 
 function getoffsetedges(aoc::ArcOffsetContour)
-    [offset(aoc.edge,x) for x in [aoc.x1,aoc.x2]]
+    [Tessen.offset(aoc.edge,x) for x in [aoc.x1,aoc.x2]]
 end
 
 function centroid(aoc::ArcOffsetContour)
@@ -247,7 +261,7 @@ end
 
 #startcap and endcap control whether the contour is closed at the beginning and end
 #of an offsetcontour
-function convert(T::Type{Contour},oc::OffsetContour;startcap=true,endcap=true)
+function convert(::Type{Contour},oc::OffsetContour;startcap=true,endcap=true)
     offsetedges = getoffsetedges(oc)
     #start with the 'first' edge
     edges = Tessen.Edge[]
@@ -296,7 +310,7 @@ function centroid(coc::CompoundOffsetContour)
     end/area(coc)
 end
 
-function convert(T::Type{Contour}, coc::CompoundOffsetContour)
+function convert(::Type{Contour}, coc::CompoundOffsetContour)
     #fill me out
     c = contours(coc)
     firstedges = convert(Contour,c[1],endcap=false).edges
@@ -309,13 +323,13 @@ function convert(T::Type{Contour}, coc::CompoundOffsetContour)
 end
 
 #add a span method for vectors of edges
-function Tessen.span(edges::Vector{Tessen.Edge})
+function Tessen.span(edges::Vector{<:Tessen.Edge})
     sum(edges) do e
         span(e)
     end
 end
 #add a subsection method for vectors of edges. We will assume this corresponds to closed paths
-function Tessen.subsection(edges::Vector{Tessen.Edge},x1::Real,x2::Real)
+function Tessen.subsection(edges::Vector{<:Tessen.Edge},x1::Real,x2::Real)
     #because this is a closed path we will accept x1 and x2 outside of the range 0 < x < span(edges)
     @assert abs(x2 - x1) < span(edges) "can't make a subsection longer than the contour"
     #if x1 is less than 0, figure out a corresponding positive position
@@ -455,12 +469,11 @@ function bumper(path,profile,maxseglength,zstart,zend,dslice,overlap,cutangle)
     blocks = map(blockcontours) do bc
         midcontour = bc[floor(Int,length(bc)/2)][2]
         slices = map(bc) do (z,bci)
-            z => Slice([convert(Contour,bci)])
+            z => Tessen.Slice([convert(Contour,bci)])
         end
         thisblock = Block(slices...)
         #move the origin of this block to the centroid of the center slice
         bt = translateorigin(thisblock,centroid(midcontour))
-        hatch(bt,dhatch=1u"μm",bottomdir=pi/4,diroffset=pi)
     end
     #build a superblock
     SuperBlock(blocks...)
@@ -479,7 +492,7 @@ function post(;kwargs...)
                     step=kwargs[:dslice])
     #`lengthpairs` will be a z => sidelength iterator
     lengthpairs = map(zcoords) do z
-        z => kwargs[:wpost] - (if z < kwargs[:hbottom]
+        z => kwargs[:wpost] - (if z <= kwargs[:hbottom]
                                    #we're underneath the beams
                                    #no undercut
                                    zero(kwargs[:wpost])
@@ -504,11 +517,10 @@ function post(;kwargs...)
     slicepairs = map(lengthpairs) do (z,l)
         #make the feet rounded in the yz/xz plane in addition to filleting in xy
         l = 0.9*l*(1 - degreefillet(z))^(1/2) + 0.1*l
-        @show l
         coords = l .* map((pi/2) .+ [0, 2pi/3, 4pi/3]) do theta
             r*[cos(theta),sin(theta)]
         end
-        z => Slice([polycontour(coords,degreefillet(z)*l*r_ins)])
+        z => Tessen.Slice([polycontour(coords,degreefillet(z)*l*r_ins)])
     end
     Block(slicepairs...)
 end
@@ -531,8 +543,56 @@ struct BeamCoords
     p2
 end
 
-function isequal(b1::BeamCoords, b2::BeamCoords)
-    (isequal(b1.p1,b2.p1) && isequal(b1.p2,b2.p2)) || (isequal(b1.p2,b2.p1) && isequal(b1.p1,b2.p2))
+struct HexCoords
+    verts
+end
+
+#need equality for these
+function Base.:(==)(x::PostCoords,y::PostCoords)
+    all(isapprox.(x.p,y.p)) && (x.lefttilt == y.lefttilt)
+end
+
+#=
+function Base.hash(x::PostCoords,h::UInt)
+    h = hash(x.p,h)
+    hash(x.lefttilt,h)
+end
+=#
+
+#Base.isequal(x::PostCoords,y::PostCoords) = x == y
+
+function Base.:(==)(b1::BeamCoords, b2::BeamCoords)
+    (all(isapprox.(b1.p1,b2.p1)) && all(isapprox.(b1.p2,b2.p2))) || (all(isapprox.(b1.p2,b2.p1)) && all(isapprox.(b1.p1,b2.p2)))
+end
+
+#=
+function Base.hash(x::BeamCoords,h::UInt)
+    h = hash(x.p1,h)
+    hash(x.p2,h)
+end
+=#
+#Base.isequal(b1::BeamCoords, b2::BeamCoords) = b1 == b2
+
+"""
+inefficient way to get unique posts or beams
+"""
+function makeunique!(v::Vector)
+    i = 1
+    while i <= length(v)
+        element = v[i]
+        #remove any other entries equal to element
+        #all indices <i are known to not contain duplicates
+        j = i+1
+        while j <= length(v)
+            if v[j] == element
+                deleteat!(v,j)
+            else
+                j+=1
+            end
+        end
+        i += 1
+    end
+    return v
 end
 
 function mapgeometry(path::Vector{LineEdge},hexsize::Quantity)
@@ -545,6 +605,7 @@ function mapgeometry(path::Vector{LineEdge},hexsize::Quantity)
     maxy = 0
     postcoords = []
     beamcoords = []
+    hexcoords = []
     currentcoords = [0,0]
     while true #scanning rows
         #we will use this to look for a column with no in bounds hexagons
@@ -563,6 +624,16 @@ function mapgeometry(path::Vector{LineEdge},hexsize::Quantity)
                     push!(beamcoords,BeamCoords(theseverts[i],theseverts[i+1]))
                 end
                 push!(beamcoords,BeamCoords(theseverts[end],theseverts[1]))
+
+                #also add HexCoords
+                hc = filter(theseverts) do v
+                    Point(v...) in outline
+                end
+                if length(hc) >= 3
+                    #if only two vertices are in bounds there's no hammock to write
+                    push!(hexcoords,HexCoords(hc))
+                end
+                
                 emptycol = false
             else
                 #no vertices lie in the outline, stop if we've gone as far as we ever have
@@ -586,14 +657,20 @@ function mapgeometry(path::Vector{LineEdge},hexsize::Quantity)
     mirroredbeamcoords = [BeamCoords(bc.p1 .* [-1,1], bc.p2 .* [-1,1]) for bc in beamcoords]
     push!(beamcoords,mirroredbeamcoords...)
     
+    mirroredhexcoords = [HexCoords([v .* [-1,1] for v in hc.verts]) for hc in hexcoords]
+    push!(hexcoords,mirroredhexcoords...)
+    
     #get all the unique posts and beams where at least one coordinate lies inside the outline
-    postcoords = filter(postcoords |> Set |> collect) do pc
+    postcoords = filter(postcoords) do pc
         Point(pc.p...) in outline
     end
-    beamcoords = filter(beamcoords |> Set |> collect) do bc
+    beamcoords = filter(beamcoords) do bc
         (Point(bc.p1...) in outline) || (Point(bc.p2...) in outline)
     end
-    return (posts=postcoords,beams=beamcoords)
+    #calculate the center of the array.
+    centerhexcoords = [0,floor(Int,maxy/2)]
+    centerverts = hexsize * oddqhexcoords(centerhexcoords...)
+    return (posts=makeunique!(postcoords),beams=makeunique!(beamcoords),center=mean(centerverts),hexcoords=hexcoords)
 end
 
 function Tessen.offset(path::Vector{<:Tessen.Edge},x::Real)
@@ -611,7 +688,401 @@ function postbeamcoords(w,h1,h2,h3,hexsize::Quantity)
     innercoords = mapgeometry(inner,hexsize)
     #the posts in outerverts that aren't in innerverts are our attachment points
     attachment = setdiff(outercoords.posts,innercoords.posts)
-    return (attachment = attachment, posts = innercoords.posts, beams = innercoords.beams)
+    return (attachment = attachment, posts = innercoords.posts, beams = innercoords.beams, center = innercoords.center,hexcoords=outercoords.hexcoords)
+end
+
+"""
+build a segmented beam with nsegs segments centered on y=0.
+startx and stopx should be the position of the edge we are bonding to at the z coordinate
+corresponding to the bottom of the beam (i.e. this function will build in overlap)
+gonna go overboard and make this a struct so we can define rotation and translation
+"""
+struct Beam
+    leftsegs
+    rightsegs
+    keystone
+end
+
+function Beam(nsegs::Int,startx,stopx,width;kwargs...)
+    #nsegs needs to be odd
+    @assert isodd(nsegs)
+    #we want the keystone to be as short as possible. Point of closest approach between the
+    #two halves is set by `keygap`
+    #length of the keystone measured at the beam midline
+    lkey = kwargs[:keygap] + kwargs[:hbeam]*tan(kwargs[:cutangle])
+    #the first segment needs to be chamfered according to `chamfertop`, we will do the rest at
+    #cutangle
+    distperseg = (stopx - startx - lkey)/(nsegs-1)
+    lseg = distperseg + kwargs[:overlap]
+    leftsegs = map(1:((nsegs-1)/2)) do i
+        #the first segment needs to be a little longer and chamfered differently
+        segpos = startx + distperseg*((2i-1)/2)
+        seg = if i==1
+            box(lseg + (kwargs[:overlap]/2),width,kwargs[:hbeam],kwargs[:dslice],
+                chamfer =[-kwargs[:chamfertop] kwargs[:cutangle]
+                          kwargs[:chamfertop]    kwargs[:chamfertop]])            
+        else
+            box(lseg,width,kwargs[:hbeam],kwargs[:dslice],
+                chamfer =[-kwargs[:cutangle]   kwargs[:cutangle]
+                          kwargs[:chamfertop]    kwargs[:chamfertop]])            
+        end
+        #seg is currently centered at [0,0,0]. Move it into position (use preserveframe so we don't
+        #move the stage
+        seg=translate(seg,[segpos,0u"µm",kwargs[:hbottom]+kwargs[:hbeam]/2],preserveframe=true)
+        if i==1
+            #scrootch a little bit back to make the overlap right
+            seg=translate(seg,[-kwargs[:overlap]/4,0u"µm",0u"µm"],preserveframe=true)
+        end
+        return seg
+    end
+    #the center of the beam in xy plane
+    cbeam = [(startx+stopx)/2,0u"µm"]
+    #we can make the right side of the bridge by rotating leftsegs around cbeam
+    rightsegs = map(leftsegs) do ls
+        rotate(ls,pi,cbeam,preserveframe=true)
+    end
+    #the keystone is cut differently
+    keystone = box(lkey,width,kwargs[:hbeam],kwargs[:dslice],
+                   chamfer =[-kwargs[:cutangle]   -kwargs[:cutangle]
+                             kwargs[:cutangle]    kwargs[:cutangle]])
+    #move it into position
+    keystone = translate(keystone,
+                         vcat(cbeam,kwargs[:hbottom]+kwargs[:hbeam]/2),
+                         preserveframe=true)
+    #return a namedtuple so we can be fancy about how we write these
+    Beam(leftsegs,rightsegs,keystone)
+end
+
+function Tessen.translate(b::Beam,args...;kwargs...)
+    Beam([translate(x,args...;kwargs...) for x in b.leftsegs],
+         [translate(x,args...;kwargs...) for x in b.rightsegs],
+         translate(b.keystone,args...;kwargs...))
+end
+
+function Tessen.rotate(b::Beam,args...;kwargs...)
+    Beam([rotate(x,args...;kwargs...) for x in b.leftsegs],
+         [rotate(x,args...;kwargs...) for x in b.rightsegs],
+         rotate(b.keystone,args...;kwargs...))
+end
+
+#use some algorithms from https://www.redblobgames.com/grids/hexagons/ to traverse
+#our kernels in a spiral
+
+struct Cube
+    q::Int
+    r::Int
+    s::Int
+end
+
+function Base.convert(::Type{Cube},v::Vector{Int})
+    @assert length(v)==3
+    Cube(v...)
+end
+
+function Base.convert(::Type{Vector{Int}},c::Cube)
+    [c.q,c.r,c.s]
+end
+
+function cube_add(hex, vec)
+    Cube(hex.q + vec.q, hex.r + vec.r, hex.s + vec.s)
+end
+
+cube_direction_vectors = [
+    Cube(+1, 0, -1), Cube(+1, -1, 0), Cube(0, -1, +1), 
+    Cube(-1, 0, +1), Cube(-1, +1, 0), Cube(0, +1, -1), 
+]
+
+function cube_direction(direction::Int)
+    cube_direction_vectors[direction]
+end
+function cube_neighbor(cube::Cube, direction::Int)
+    cube_add(cube, cube_direction(direction))
+end
+
+function cube_scale(hex::Cube,factor::Number)
+    Cube(hex.q * factor, hex.r * factor, hex.s * factor)
+end
+
+function cube_ring(center::Cube, radius::Int)
+    results = []
+    hex = cube_add(center, cube_scale(cube_direction(5), radius))
+    for i in 1:6
+        for _ in 1:radius
+            push!(results,hex)
+            hex = cube_neighbor(hex,i)
+        end
+    end
+    return results
+end
+
+"""
+Type for iterating through the cubic coordinates of a spiral
+traversal of a hexagonal grid. Returns one 'ring' of cubic
+coordinates per iteration
+"""
+struct CubeSpiral
+    center::Cube
+end
+
+#return the center
+function Base.iterate(cs::CubeSpiral)
+    return ([cs.center],1)
+end
+
+#now work through the rings
+function Base.iterate(cs::CubeSpiral,radius::Int)
+    return (cube_ring(Cube(0,0,0),radius), radius+1)
+end
+
+Base.IteratorSize(::Type{CubeSpiral}) = Base.IsInfinite()
+
+cube_spiral(center,radius::Int) = cube_spiral(convert(Cube,center),radius)
+
+function cubetocartesian(cubecoords::Cube,hexsize)
+    hexsize * [3/2         0
+               sqrt(3)/2   sqrt(3)] * [cubecoords.q, cubecoords.r]
+end
+
+function kernelcenters(center, hexsize, nkernel)
+    #get the hex size of our kernel
+    kernelsize = nkernel*hexsize
+    #make an infinite generator of cartesian coordinates
+    ([cubetocartesian(ci,kernelsize) + center for ci in cc] for cc in CubeSpiral(Cube(0,0,0)))
+end
+
+"""
+move `vert` towards `point` by `amount`
+
+```julia
+scrootchvert(vert,point,amount)
+```
+end
+"""
+function scrootchvert(vert,point,amount)
+    #get a unit vector going from vert to point
+    vec = (point - vert)
+    uvec = vec/norm(vec)
+    vert + amount*uvec
+end
+
+function scaffold(scaffolddir;kwargs...)
+    mkdir(scaffolddir)
+    kernels = cd(scaffolddir) do
+        mkdir("scripts")
+        #build the bumper
+        ov = outlineverts(2,3,5,3)
+        p = polycontour(ov*kwargs[:hexsize],kwargs[:bumperfillet]).edges
+        bec = bumperedgecoords(;kwargs...)
+        #largest section of bumper which can be printed at a time
+        #maxbumperseg = sqrt(kwargs[:dfield]^2 - kwargs[:wbumper]^2)
+        b = Toast.bumper(p,bec,kwargs[:bumperseglength],zero(kwargs[:hbottom]),
+                         kwargs[:hbottom]+kwargs[:htop],kwargs[:dslice],kwargs[:overlap],
+                         kwargs[:cutangle])
+        @info "hatching bumper"
+        bh = hatch(b,kwargs[:dhatch],0,pi/2)
+        @info "compiling bumper"
+        compbumper = CompiledGeometry(joinpath("scripts","bumper.gwl"),bh;laserpower=kwargs[:laserpower],scanspeed=kwargs[:scanspeed])
+        #get the coordinates of all the posts and beams
+        pc = Toast.postbeamcoords(2,3,5,3,kwargs[:hexsize])
+
+        #I now want to build two dicts, one which tracks whether a post has been written or not
+        #and one which maps beams to the corresponding posts
+
+        #first build the postdict, marking all posts as unwritten
+        postdict = Dict(p => false for p in pc.posts)
+
+        #now build a dict mapping beams to posts
+        beamdict = Dict(map(pc.beams) do b
+                            posts = map([b.p1, b.p2]) do coord
+                                pvec = filter(pc.posts) do post
+                                    all(isapprox.(coord,post.p))                                
+                                end
+                                if length(pvec) == 1
+                                    return pvec[1]
+                                else
+                                    @assert length(pvec) == 0
+                                    #make sure this is in attachments
+                                    attvec = filter(pc.attachment) do a
+                                        all(isapprox.(coord,a.p))
+                                    end
+                                    @assert length(attvec) == 1
+                                    return nothing
+                                end
+                            end
+                            b => posts
+                        end...)
+        #figure out how big one kernel is in terms of hex size
+        rfield = kwargs[:dfield]/2
+        buffer = 1.25 #expand our kernel FOV a little to avoid numerical precision issues
+        nhexkernel = floor(Int,rfield/(kwargs[:hexsize]*buffer))
+        #get our kernel radius in microns
+        rkernel = buffer * kwargs[:hexsize] * nhexkernel
+        #now, start in the center and spiral outward writing geometry until we run out of posts
+        #write a beam whenever it's supporting posts are both written
+        firstcenter = pc.center
+        #get a generator for kernel centers
+        kcgen = kernelcenters(firstcenter, kwargs[:hexsize], nhexkernel)
+        #build all the kernels
+        kernels = [compbumper]
+        #keep building kernels until we spiral past the end of the scaffold
+        #this generator is infinite
+        #build a generic post that we can translate/rotate to make the others
+        genericpost = post(;kwargs...)
+        #keep track of where we are in the spiral
+        lastcenter = zero(firstcenter)
+        for (i,ring) in enumerate(kcgen)
+            emptyring = true
+            for (j,kernelcenter) in enumerate(ring)
+                @info "kernel $j on ring $i"
+                #find all the unwritten posts in range
+                coordinkernel(c) = norm(c - kernelcenter) <= rkernel
+                #we may need to worry about big posts being outside the FOV at some point
+                ourposts = filter(keys(postdict)|>collect) do pi
+                    coordinkernel(pi.p)
+                end
+                if !isempty(ourposts)
+                    emptyring = false
+                else
+                    continue
+                end
+                #build blocks for all these posts
+                postblocks = map(ourposts) do p_i
+                    if postdict[p_i]
+                        #already wrote this one
+                        return nothing
+                    end
+                    #mark as written
+                    postdict[p_i] = true
+                    #first do the rotation
+                    rotpost = rotate(genericpost,p_i.lefttilt ? pi/6 : -pi/6,preserveframe=true)
+                    #then translate
+                    translate(rotpost,p_i.p - kernelcenter,preserveframe=true)
+                end
+                #merge
+                filter!(postblocks) do pb
+                    !isnothing(pb)
+                end
+                #no need to merge if there's one or zero posts
+                mergedposts = (length(postblocks)>1) ? [merge(postblocks...)] : postblocks
+                #check for beams we can write
+                ourbeams = filter(collect(keys(beamdict))) do bi
+                    all(beamdict[bi]) do pi
+                        #check if both supporting posts have been written
+                        isnothing(pi) || postdict[pi]
+                    end
+                end
+                #build beam blocks
+                beamblocks = map(ourbeams) do bi
+                    #delete from beamdict so we don't rewrite
+                    delete!(beamdict,bi)
+                    #vector along the beam
+                    bvec = bi.p2 - bi.p1
+                    #get a unit vector along the beam
+                    ubeam = bvec/norm(bvec)
+                    #we don't want to go from center to center, we want to go edge to edge.
+                    centertoedgedist = sqrt(3*(kwargs[:wpost]^2)/4)/2
+                    startpoint = bi.p1 + ubeam*centertoedgedist
+                    endpoint = bi.p2 - ubeam*centertoedgedist
+                    bvec = endpoint - startpoint
+                    #get the length of the beam (should always be the same)
+                    beamlength = norm(bvec)
+                    #get the angle that the vector from p1 to p2 makes with the x axis
+                    theta = atan(reverse(bvec)/beamlength...)
+                    #build a horizontal beam with the correct length
+                    nsegs = ceil(Int,beamlength/kwargs[:maxseglength])
+                    nsegs = isodd(nsegs) ? nsegs : nsegs+1
+                    #build a post along the x axis
+                    #the width parameter to beam corresponds to the width at the midline
+                    #we want the width to be wpost at the bottom
+                    wbeam = kwargs[:wpost] - kwargs[:hbeam]*tan(kwargs[:chamfertop])
+                    hbeam = Beam(nsegs,zero(beamlength),beamlength,wbeam;kwargs...)
+                    #rotate
+                    rotbeam = rotate(hbeam,theta,preserveframe=true)
+                    #translate
+                    translate(rotbeam,startpoint - kernelcenter,preserveframe=true)
+                end
+                #merge beam segments
+                #we now want to merge all of our beams so the segments print starting from
+                #the posts
+                #get a vector containing each 'half' beam
+                halfbeams = vcat(map(beamblocks) do b
+                                     [b.leftsegs, b.rightsegs]
+                                 end...)
+                halfbeamblocks = iszero(length(halfbeams)) ? [] : map(zip(halfbeams...)) do hb
+                    #hb should now be all of the first segs, or all of the second segs, etc
+                    merge(hb...)
+                end
+                #now need to collect all of the keystones
+                allkeys = map(beamblocks) do b
+                    b.keystone
+                end
+                
+                #and merge them
+                keyblock = iszero(length(allkeys)) ? [] : [merge(allkeys...)]
+                                 
+                #build a SuperBlock
+                allblocks = vcat(mergedposts,halfbeamblocks,keyblock)               
+                if isempty(allblocks)
+                    #no geometry to write
+                    continue
+                end
+                postbeams = SuperBlock(allblocks...)
+                
+                #build hammocks (only need to do this if we printed other geometry, hence continue above
+                ourhams = filter(pc.hexcoords) do h
+                    all(h.verts) do v
+                        coordinkernel(v)
+                    end
+                end
+
+                #remove these hammocks from pc.hexcoords so we don't rewrite
+                filter!(pc.hexcoords) do h
+                    !all(h.verts) do v
+                        coordinkernel(v)
+                    end
+                end
+
+                #distance from the center of the post to the point of the triangle at the bottom of the beam
+                bottombeamoffset = kwargs[:wpost]/sqrt(3)
+                #offset at the top of the beam
+                topbeamoffset = bottombeamoffset - kwargs[:hbeam]*tan(kwargs[:chamfertop])
+                hams = map(ourhams) do ham
+                    #start from the top of the beams
+                    thisz = kwargs[:hbottom]+kwargs[:hbeam]
+                    hamcenter = mean(ham.verts)
+                    thishamverts = [scrootchvert(hv,hamcenter,topbeamoffset) for hv in ham.verts]
+                    slices = map(1:kwargs[:nhammock]) do _
+                        toreturn = thisz => Tessen.Slice([polycontour(thishamverts)])
+                        thisz -= kwargs[:dhammockslice]
+                        thishamverts = [scrootchvert(thv,hamcenter,kwargs[:dhammockslice]*tan(kwargs[:chamfertop])) for thv in thishamverts]
+                        return toreturn
+                    end
+                    Block(slices...)
+                end
+                
+                #hatch
+                @info "hatching kernel $i-$j"
+                hatched = hatch(postbeams,kwargs[:dhatch],0,pi/2)
+                #i think we will always have hammocks to write
+                hamhatched = hatch(merge(hams...),kwargs[:dhammockhatch],0,pi/2)
+                @info "compiling kernel $i-$j"                
+                #compile
+                cg = CompiledGeometry(joinpath("scripts","kernel_($i-$j).gwl"),hatched;laserpower=kwargs[:laserpower],scanspeed=kwargs[:scanspeed])
+                ch = CompiledGeometry(joinpath("scripts","kernel_($i-$j)_hammocks.gwl"),hamhatched;laserpower=kwargs[:hamlaserpower],scanspeed=kwargs[:hamscanspeed])
+                cg = translate(cg,[kernelcenter...,zero(kernelcenter[1])])
+                #ch = translate(ch,[kernelcenter...,zero(kernelcenter[1])])
+                #cg = translate(cg,[(kernelcenter-lastcenter)...,zero(kernelcenter[1])])
+                lastcenter=kernelcenter
+                push!(kernels,cg,ch)
+            end
+            if emptyring
+                #if we didn't find any posts in this ring
+                break
+            end
+        end
+        return kernels
+    end
+    GWLJob(joinpath(scaffolddir,"scaffold.gwl"),kernels...;stagespeed=kwargs[:stagespeed],interfacepos=kwargs[:interfacepos])
 end
 
 end # module Toast
