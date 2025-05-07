@@ -502,7 +502,9 @@ function post(;kwargs...)
                                else
                                    #we're on top of the beams
                                    #the amount of 'overcut'
-                                   2*(z-kwargs[:hbottom])*tan(kwargs[:chamfertop])
+                                   #have to divide by tan(30) to account for how moving the edge
+                                   #of the triangle towards its center changes the side length
+                                   2*(z-kwargs[:hbottom])*tan(kwargs[:chamfertop])/tand(30)
                                end)
     end
 
@@ -994,7 +996,7 @@ function scaffold(scaffolddir,kwargs::Dict)
                     #get a unit vector along the beam
                     ubeam = bvec/norm(bvec)
                     #we don't want to go from center to center, we want to go edge to edge.
-                    centertoedgedist = sqrt(3*(kwargs[:wpost]^2)/4)/2
+                    centertoedgedist = kwargs[:wpost]*tand(30)/2
                     startpoint = bi.p1 + ubeam*centertoedgedist
                     endpoint = bi.p2 - ubeam*centertoedgedist
                     bvec = endpoint - startpoint
@@ -1071,7 +1073,8 @@ function scaffold(scaffolddir,kwargs::Dict)
                 #distance from the center of the post to the point of the triangle at the bottom of the beam
                 bottombeamoffset = kwargs[:wpost]/sqrt(3)
                 #offset at the top of the beam
-                topbeamoffset = bottombeamoffset - kwargs[:hbeam]*tan(kwargs[:chamfertop])
+                #have to divide by cos(30) to account for the points moving at a different rate than the sides of the triangle
+                topbeamoffset = bottombeamoffset - kwargs[:hbeam]*tan(kwargs[:chamfertop])/cosd(30)
                 hams = map(ourhams) do ham
                     #start from the top of the beams
                     thisz = kwargs[:hbottom]+kwargs[:hbeam]
