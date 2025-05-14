@@ -946,7 +946,32 @@ function scaffold(scaffolddir,kwargs::Dict)
         genericpost = post(;kwargs...)
         #keep track of where we are in the spiral
         lastcenter = zero(firstcenter)
+        #collect all the kernel centers we are going to use so we can reverse the spiral
+        #I know I'm copy-pasting from the main kernel building loop in a way that is hacky
+        #but the Danes are here and I want a working job
+        kcvec=[]
         for (i,ring) in enumerate(kcgen)
+            emptyring = true
+            for (j,kernelcenter) in enumerate(ring)
+                coordinkernel(c) = norm(c - kernelcenter) <= rkernel
+                #we may need to worry about big posts being outside the FOV at some point
+                ourposts = filter(keys(postdict)|>collect) do pi
+                    coordinkernel(pi.p)
+                end
+                if !isempty(ourposts)
+                    emptyring = false
+                else
+                    continue
+                end
+            end
+            if !emptyring
+                push!(kcvec,(i,ring))
+            else
+                break
+            end
+        end
+        
+        for (i,ring) in reverse(kcvec)
             emptyring = true
             for (j,kernelcenter) in enumerate(ring)
                 @info "kernel $j on ring $i"
