@@ -46,6 +46,7 @@ will be written to `"config.jl"`.
 - hexsize: Size of component hexagons
 - bumperfillet: Amount to round the corners of the bumper
 - bumperseglength: maximum length (along path) of a single bumper segment
+- cornerdiff: How much bigger to make the bottom right corner
 """
 function createconfig(filename="config.jl")
     config = """Dict(
@@ -80,6 +81,7 @@ function createconfig(filename="config.jl")
         :hexsize => 50u"µm",
         :bumperfillet => 250u"µm",
         :bumperseglength => 500u"µm"
+        :cornerdiff => 1
     )
     """
     open(filename,"w") do io
@@ -612,50 +614,56 @@ function mapgeometry(path::Vector{LineEdge},hexsize::Quantity)
     beamcoords = []
     hexcoords = []
     currentcoords = [0,0]
-    while true #scanning rows
-        #we will use this to look for a column with no in bounds hexagons
-        emptycol = true
-        currentcoords[2] = 0
-        while true #scanning columns
-            theseverts = hexsize * oddqhexcoords(currentcoords...)            
-            if any(Point(v...) in outline for v in theseverts)
-                #this hexagon lies in the outline
-                #make PostCoords and BeamCoords objects
-                for (p,lt) in zip(theseverts,repeat([true,false],3))
-                    thispost = PostCoords(p,lt)
-                    push!(postcoords,thispost)
-                end
-                for i in 1:5
-                    push!(beamcoords,BeamCoords(theseverts[i],theseverts[i+1]))
-                end
-                push!(beamcoords,BeamCoords(theseverts[end],theseverts[1]))
+    advancerow = (x) -> x + [1,0]
+    #do the right half and then the left
+    for _ in 1:2
+        while true #scanning rows
+            #we will use this to look for a column with no in bounds hexagons
+            emptycol = true
+            currentcoords[2] = 0
+            while true #scanning columns
+                theseverts = hexsize * oddqhexcoords(currentcoords...)            
+                if any(Point(v...) in outline for v in theseverts)
+                    #this hexagon lies in the outline
+                    #make PostCoords and BeamCoords objects
+                    for (p,lt) in zip(theseverts,repeat([true,false],3))
+                        thispost = PostCoords(p,lt)
+                        push!(postcoords,thispost)
+                    end
+                    for i in 1:5
+                        push!(beamcoords,BeamCoords(theseverts[i],theseverts[i+1]))
+                    end
+                    push!(beamcoords,BeamCoords(theseverts[end],theseverts[1]))
 
-                #also add HexCoords
-                hc = filter(theseverts) do v
-                    Point(v...) in outline
+                    #also add HexCoords
+                    hc = filter(theseverts) do v
+                        Point(v...) in outline
+                    end
+                    if length(hc) >= 3
+                        #if only two vertices are in bounds there's no hammock to write
+                        push!(hexcoords,HexCoords(hc))
+                    end
+                    
+                    emptycol = false
+                else
+                    #no vertices lie in the outline, stop if we've gone as far as we ever have
+                    if currentcoords[2] >= maxy
+                        maxy = currentcoords[2]
+                        break
+                    end
                 end
-                if length(hc) >= 3
-                    #if only two vertices are in bounds there's no hammock to write
-                    push!(hexcoords,HexCoords(hc))
-                end
-                
-                emptycol = false
-            else
-                #no vertices lie in the outline, stop if we've gone as far as we ever have
-                if currentcoords[2] >= maxy
-                    maxy = currentcoords[2]
-                    break
-                end
+                currentcoords += [0,1]
             end
-            currentcoords += [0,1]
+            #we're done if this column was empty
+            if emptycol
+                break
+            end
+            currentcoords = advancerow(currentcoords)
         end
-        #we're done if this column was empty
-        if emptycol
-            break
-        end
-        currentcoords += [1,0]
+        advancerow = (x) -> x - [1,0]
+        currentcoords = [-1,0]
     end
-    #mirror the coords (assuming symmetry around y axis)
+    #====mirror the coords (assuming symmetry around y axis), shouldn't need this now=======
     mirroredpostcoords = [PostCoords(pc.p .* [-1,1], !pc.lefttilt) for pc in postcoords]
     push!(postcoords,mirroredpostcoords...)
 
@@ -664,7 +672,7 @@ function mapgeometry(path::Vector{LineEdge},hexsize::Quantity)
     
     mirroredhexcoords = [HexCoords([v .* [-1,1] for v in hc.verts]) for hc in hexcoords]
     push!(hexcoords,mirroredhexcoords...)
-    
+    ========================================================================================#
     #get all the unique posts and beams where at least one coordinate lies inside the outline
     postcoords = filter(postcoords) do pc
         Point(pc.p...) in outline
@@ -682,8 +690,11 @@ function Tessen.offset(path::Vector{<:Tessen.Edge},x::Real)
     [Tessen.offset(p,x) for p in path]
 end
 
-function postbeamcoords(w,h1,h2,h3,hexsize::Quantity)
-    bumperpath = polycontour(outlineverts(w,h1,h2,h3)*hexsize).edges
+function postbeamcoords(w,h1,h2,h3,cornerdiff,hexsize::Quantity)
+    @assert (h1 - 2*cornerdiff) > 0 "cornerdiff is too large"
+    ov1 = outlineverts(w + 2*cornerdiff,h1 - 2*cornerdiff,h2,h3)
+    ov2 = outlineverts(w,h1,h2,h3)
+    bumperpath = polycontour(vcat(ov1[1:2],ov2[3:8])*hexsize).edges
     #get an outline a little bigger than we want
     outer = Tessen.offset(bumperpath,0.1*hexsize)
     #and one a little smaller
@@ -886,7 +897,12 @@ function scaffold(scaffolddir,kwargs::Dict)
     kernels = cd(scaffolddir) do
         mkdir("scripts")
         #build the bumper
-        ov = outlineverts(kwargs[:w],kwargs[:h1],kwargs[:h2],kwargs[:h3])
+        #we will make two outlines, one stubbier than the other
+        @assert (kwargs[:h1] - 2*kwargs[:cornerdiff]) > 0 "cornerdiff is too large"
+        ov1 = outlineverts(kwargs[:w] + 2*kwargs[:cornerdiff],kwargs[:h1] - 2*kwargs[:cornerdiff],kwargs[:h2],kwargs[:h3])
+        ov2 = outlineverts(kwargs[:w],kwargs[:h1],kwargs[:h2],kwargs[:h3])
+        #this will give us asymmetry so we can easily verify orientation
+        ov = vcat(ov1[1:2],ov2[3:8])
         p = polycontour(ov*kwargs[:hexsize],kwargs[:bumperfillet]).edges
         bec = bumperedgecoords(;kwargs...)
         #largest section of bumper which can be printed at a time
@@ -899,7 +915,7 @@ function scaffold(scaffolddir,kwargs::Dict)
         @info "compiling bumper"
         compbumper = CompiledGeometry(joinpath("scripts","bumper.gwl"),bh;laserpower=kwargs[:laserpower],scanspeed=kwargs[:scanspeed])
         #get the coordinates of all the posts and beams
-        pc = Toast.postbeamcoords(kwargs[:w],kwargs[:h1],kwargs[:h2],kwargs[:h3],kwargs[:hexsize])
+        pc = Toast.postbeamcoords(kwargs[:w],kwargs[:h1],kwargs[:h2],kwargs[:h3],kwargs[:cornerdiff],kwargs[:hexsize])
 
         #I now want to build two dicts, one which tracks whether a post has been written or not
         #and one which maps beams to the corresponding posts
