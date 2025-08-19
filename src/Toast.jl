@@ -47,6 +47,7 @@ will be written to `"config.jl"`.
 - bumperfillet: Amount to round the corners of the bumper
 - bumperseglength: maximum length (along path) of a single bumper segment
 - cornerdiff: How much bigger to make the bottom right corner
+- hamoffset: how far 'above' the beams to place the hammocks
 """
 function createconfig(filename="config.jl")
     config = """Dict(
@@ -80,8 +81,9 @@ function createconfig(filename="config.jl")
         :h3 => 3,
         :hexsize => 50u"µm",
         :bumperfillet => 250u"µm",
-        :bumperseglength => 500u"µm"
-        :cornerdiff => 1
+        :bumperseglength => 500u"µm",
+        :cornerdiff => 1,
+        :hamoffset => 0u"µm"
     )
     """
     open(filename,"w") do io
@@ -551,7 +553,69 @@ struct BeamCoords
 end
 
 struct HexCoords
-    verts
+    hexsize
+    qr #cubic coordinates of hexagon
+    verts #cartesian coordinates of verts
+end
+
+#if we just want all the vertices
+function HexCoords(hexsize,qr)
+    temphex = HexCoords(hexsize,qr,nothing)
+    av = allverts(temphex)
+    HexCoords(hexsize,qr,av)
+end
+
+"""
+```julia
+neighborqrcoords(hc::HexCoords)
+```
+Get the coordinates (in hexagonal qr coordinates) of hexagons
+neighboring `hc`.
+"""
+function neighborqrcoords(hc::HexCoords)
+    #offsets are different if the q coordinate is even or odd
+    #https://www.redblobgames.com/grids/hexagons/#neighbors
+    offsetvec = if iseven(hc.qr[1])
+        [[1,0],
+         [1,-1],
+         [0,-1],
+         [-1,-1],
+         [-1,0],
+         [0,1]]
+    else
+        [[1,1],
+         [1,0],
+         [0,-1],
+         [-1,0],
+         [-1,1],
+         [0,1]]
+    end
+    
+    [hc.qr + a for a in offsetvec]
+end
+
+"""
+```julia
+allverts(hc::HexCoords)
+```
+Get all vertices of a hexagon (i.e. including ones that may not have a post)
+"""
+function allverts(hc::HexCoords)
+    hc.hexsize * oddqhexcoords(hc.qr...)
+end
+
+"""
+```julia
+edges(hc::HexCoords)
+```
+Get the edges (as `Vector{Vector}`) of `hc`, presented in the same 'order`
+as neighborqrcoords(hc).
+"""
+function edges(hc::HexCoords)
+    v = allverts(hc)
+    map(2:7) do i
+        [v[i-1],v[(i<7) ? i : i%6]] #we have to 'wrap around' to close the hexagon
+    end
 end
 
 #need equality for these
@@ -641,7 +705,7 @@ function mapgeometry(path::Vector{LineEdge},hexsize::Quantity)
                     end
                     if length(hc) >= 3
                         #if only two vertices are in bounds there's no hammock to write
-                        push!(hexcoords,HexCoords(hc))
+                        push!(hexcoords,HexCoords(hexsize,currentcoords,hc))
                     end
                     
                     emptycol = false
@@ -881,6 +945,78 @@ function scrootchvert(vert,point,amount)
     vert + amount*uvec
 end
 
+function findhexboundary(ourhams::Vector{HexCoords})
+    #ok, we need to build a big dict mapping the hexagonal (qr) coordinates
+    #of our hexagons to the objects themselves
+    #if there is only one hammock, just return its edges
+    if length(ourhams) == 1
+        return Contour([LineEdge(e...) for e in edges(ourhams[1])])
+    end
+    
+    hamdict = Dict(oh.qr => oh for oh in ourhams)
+    #find a hammock missing a neighbor (on the outside)
+    hamqr = collect(keys(hamdict))
+    edgeham = filter(ourhams) do oh
+        !all(nqr in hamqr for nqr in neighborqrcoords(oh))
+    end
+    #start at an arbitrary hammock on the edge
+    curham = edgeham[1]
+    #find an empty edge
+    #little helper function to see if edge i on a hammock is 'empty'
+    function edgeempty(h::HexCoords,i::Int)
+        @show hamqr
+        @show i
+        @show neighborqrcoords(h)[i]
+        !(neighborqrcoords(h)[i] in hamqr)
+    end
+    #helper for fetching neighbor hexcoords objects from hamdict
+    neighborhex(h::HexCoords,i::Int) = hamdict[neighborqrcoords(h)[i]]
+    #mapping for where we should start scanning edges if a given edge is full
+    nextedge = [5,6,1,2,3,4]
+    curedge = 1
+    while edgeempty(curham,curedge)
+        curedge += 1
+    end
+    #we now know our edge isn't empty
+    while !edgeempty(curham,curedge)
+        curedge += 1
+        if curedge > 6
+            curedge %= 6
+        end
+    end
+    #now we know we are on the boundary adjacent to another hex
+    boundary = []
+    startqr = curham.qr    
+    startedge = curedge
+    while true
+        @show curham.qr
+        @show curedge
+        @show startqr
+        @show startedge
+        if edgeempty(curham,curedge)
+            #curedge is on boundary
+            @show "on boundary"
+            push!(boundary,edges(curham)[curedge])
+            curedge += 1
+            #test to make sure we don't need to roll over
+            if curedge > 6
+                curedge = curedge%6
+            end
+        else
+            #curedge is not on boundary, walk to neighbor
+            curham = neighborhex(curham,curedge)
+            curedge = nextedge[curedge]
+            @show "moving to edge $curedge on neighbor $neighborhex"
+        end
+        #check to see if we've made it all the way around
+        if (curham.qr == startqr) && (startedge==curedge)
+            break
+        end
+    end
+    #make a Contour to return
+    return Contour([LineEdge(b...) for b in boundary])
+end
+
 """
 ```julia
 scaffold(scaffolddir[, configfilename])
@@ -1098,7 +1234,7 @@ function scaffold(scaffolddir,kwargs::Dict)
                     isempty(thispostcoord) ? true : postdict[thispostcoord[1]]
                 end
                 
-                ourhams = filter(pc.hexcoords) do h
+                @show ourhams = filter(pc.hexcoords) do h
                     all(h.verts) do v
                         supportwritten(v)
                     end
@@ -1110,31 +1246,21 @@ function scaffold(scaffolddir,kwargs::Dict)
                         supportwritten(v)
                     end
                 end
-
-                #distance from the center of the post to the point of the triangle at the bottom of the beam
-                bottombeamoffset = kwargs[:wpost]/sqrt(3)
-                #offset at the top of the beam
-                #have to divide by cos(30) to account for the points moving at a different rate than the sides of the triangle
-                topbeamoffset = bottombeamoffset - kwargs[:hbeam]*tan(kwargs[:chamfertop])/cosd(30)
-                hams = map(ourhams) do ham
-                    #start from the top of the beams
-                    thisz = kwargs[:hbottom]+kwargs[:hbeam]
-                    hamcenter = mean(ham.verts)
-                    thishamverts = [scrootchvert(hv,hamcenter,topbeamoffset) - kernelcenter for hv in ham.verts]
-                    slices = map(1:kwargs[:nhammock]) do _
-                        toreturn = thisz => Tessen.Slice([polycontour(thishamverts)])
-                        thisz -= kwargs[:dhammockslice]
-                        thishamverts = [scrootchvert(thv,hamcenter,kwargs[:dhammockslice]*tan(kwargs[:chamfertop])) for thv in thishamverts]
-                        return toreturn
-                    end
-                    Block(slices...)
-                end
                 
+                boundary = findhexboundary(convert(Vector{HexCoords},ourhams))
+                #start from :hamoffset above the top of the beams
+                thisz = kwargs[:hbottom]+kwargs[:hbeam]+kwargs[:hamoffset]
+                slices = map(1:kwargs[:nhammock]) do _
+                    toreturn = thisz => Tessen.Slice([boundary])
+                    thisz += kwargs[:dhammockslice]
+                    return toreturn
+                end
+                floorblock = Block(slices...)                
                 #hatch
                 @info "hatching kernel $i-$j"
                 hatched = hatch(postbeams,kwargs[:dhatch],0,pi/2)
                 #i think we will always have hammocks to write
-                hamhatched = hatch(merge(hams...),kwargs[:dhammockhatch],0,pi/2)
+                hamhatched = hatch(floorblock,kwargs[:dhammockhatch],0,pi/2)
                 @info "compiling kernel $i-$j"                
                 #compile
                 cg = CompiledGeometry(joinpath("scripts","kernel_($i-$j).gwl"),hatched;laserpower=kwargs[:laserpower],scanspeed=kwargs[:scanspeed])
