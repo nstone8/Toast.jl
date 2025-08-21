@@ -618,6 +618,14 @@ function edges(hc::HexCoords)
     end
 end
 
+"""
+```julia
+center(hc::HexCoords)
+```
+Get the center of a hex
+"""
+center(hc::HexCoords) = mean(hc.verts)
+
 #need equality for these
 function Base.:(==)(x::PostCoords,y::PostCoords)
     all(isapprox.(x.p,y.p)) && (x.lefttilt == y.lefttilt)
@@ -764,6 +772,7 @@ function postbeamcoords(w,h1,h2,h3,cornerdiff,hexsize::Quantity)
     #and one a little smaller
     inner = Tessen.offset(bumperpath,-0.1*hexsize)
     #now get the vertices in each
+    #nomcoords = mapgeometry(bumperpath,hexsize)
     outercoords = mapgeometry(outer,hexsize)
     innercoords = mapgeometry(inner,hexsize)
     #the posts in outerverts that aren't in innerverts are our attachment points
@@ -800,11 +809,11 @@ function Beam(nsegs::Int,startx,stopx,width;kwargs...)
         seg = if i==1
             box(lseg + (kwargs[:overlap]/2),width,kwargs[:hbeam],kwargs[:dslice],
                 chamfer =[-kwargs[:chamfertop] kwargs[:cutangle]
-                          kwargs[:chamfertop]    kwargs[:chamfertop]])            
+                          0                    0])            
         else
             box(lseg,width,kwargs[:hbeam],kwargs[:dslice],
                 chamfer =[-kwargs[:cutangle]   kwargs[:cutangle]
-                          kwargs[:chamfertop]    kwargs[:chamfertop]])            
+                          0                    0])            
         end
         #seg is currently centered at [0,0,0]. Move it into position (use preserveframe so we don't
         #move the stage
@@ -824,7 +833,7 @@ function Beam(nsegs::Int,startx,stopx,width;kwargs...)
     #the keystone is cut differently
     keystone = box(lkey,width,kwargs[:hbeam],kwargs[:dslice],
                    chamfer =[-kwargs[:cutangle]   -kwargs[:cutangle]
-                             kwargs[:cutangle]    kwargs[:cutangle]])
+                             0                    0])
     #move it into position
     keystone = translate(keystone,
                          vcat(cbeam,kwargs[:hbottom]+kwargs[:hbeam]/2),
@@ -947,74 +956,83 @@ end
 
 function findhexboundary(ourhams::Vector{HexCoords})
     #ok, we need to build a big dict mapping the hexagonal (qr) coordinates
-    #of our hexagons to the objects themselves
-    #if there is only one hammock, just return its edges
-    if length(ourhams) == 1
-        return Contour([LineEdge(e...) for e in edges(ourhams[1])])
-    end
-    
+    #of our hexagons to the objects themselves    
     hamdict = Dict(oh.qr => oh for oh in ourhams)
     #find a hammock missing a neighbor (on the outside)
     hamqr = collect(keys(hamdict))
-    edgeham = filter(ourhams) do oh
-        !all(nqr in hamqr for nqr in neighborqrcoords(oh))
-    end
-    #start at an arbitrary hammock on the edge
-    curham = edgeham[1]
-    #find an empty edge
-    #little helper function to see if edge i on a hammock is 'empty'
-    function edgeempty(h::HexCoords,i::Int)
-        @show hamqr
-        @show i
-        @show neighborqrcoords(h)[i]
-        !(neighborqrcoords(h)[i] in hamqr)
-    end
+
     #helper for fetching neighbor hexcoords objects from hamdict
     neighborhex(h::HexCoords,i::Int) = hamdict[neighborqrcoords(h)[i]]
+
+    #little helper function to see if edge i on a hammock is 'empty'
+    function edgeempty(h::HexCoords,i::Int)
+        !(neighborqrcoords(h)[i] in hamqr)
+    end
+
+    #list of hammocks on the edge of our FOV
+    edgeham = filter(ourhams) do oh
+        any(edgeempty(oh,i) for i in 1:6)
+    end
+    
     #mapping for where we should start scanning edges if a given edge is full
     nextedge = [5,6,1,2,3,4]
-    curedge = 1
-    while edgeempty(curham,curedge)
-        curedge += 1
-    end
-    #we now know our edge isn't empty
-    while !edgeempty(curham,curedge)
-        curedge += 1
-        if curedge > 6
-            curedge %= 6
+    
+    contours = Contour[]
+    while !isempty(edgeham)
+        #start at an arbitrary hammock on the edge
+        curham = edgeham[1]
+        #if all edges on curham are empty, this is an isolated hammock. Add all the edges to a new contour
+        if all(edgeempty(curham,i) for i in 1:6)
+            push!(contours,Contour([LineEdge(e...) for e in edges(curham)]))
+            #delete this from edgeham
+            popfirst!(edgeham)
+            continue
         end
-    end
-    #now we know we are on the boundary adjacent to another hex
-    boundary = []
-    startqr = curham.qr    
-    startedge = curedge
-    while true
-        @show curham.qr
-        @show curedge
-        @show startqr
-        @show startedge
-        if edgeempty(curham,curedge)
-            #curedge is on boundary
-            @show "on boundary"
-            push!(boundary,edges(curham)[curedge])
+        #find an empty edge
+        curedge = 1
+        while edgeempty(curham,curedge)
             curedge += 1
-            #test to make sure we don't need to roll over
-            if curedge > 6
-                curedge = curedge%6
-            end
-        else
-            #curedge is not on boundary, walk to neighbor
-            curham = neighborhex(curham,curedge)
-            curedge = nextedge[curedge]
-            @show "moving to edge $curedge on neighbor $neighborhex"
         end
-        #check to see if we've made it all the way around
-        if (curham.qr == startqr) && (startedge==curedge)
-            break
+        #we now know our edge isn't empty
+        while !edgeempty(curham,curedge)
+            curedge += 1
+            if curedge > 6
+                curedge %= 6
+            end
+        end
+        #now we know we are on the boundary adjacent to another hex
+        boundary = []
+        startqr = curham.qr    
+        startedge = curedge
+        while true
+            if edgeempty(curham,curedge)
+                #curedge is on boundary
+                push!(boundary,edges(curham)[curedge])
+                curedge += 1
+                #test to make sure we don't need to roll over
+                if curedge > 6
+                    curedge = curedge%6
+                end
+            else
+                #curedge is not on boundary, walk to neighbor
+                curham = neighborhex(curham,curedge)
+                curedge = nextedge[curedge]
+            end
+            #check to see if we've made it all the way around
+            if (curham.qr == startqr) && (startedge==curedge)
+                break
+            end
+        end
+        #make a Contour to return
+        push!(contours,Contour([LineEdge(b...) for b in boundary]))
+        #now remove all hexes contained by this contour from edgeham
+        contourverts = [(b[1] for b in boundary)...,boundary[end][2]]
+        contouroutline = Ngon((Point(v...) for v in contourverts)...)
+        filter!(edgeham) do h
+            !(Point(center(h)...) in contouroutline)
         end
     end
-    #make a Contour to return
-    return Contour([LineEdge(b...) for b in boundary])
+    return contours
 end
 
 """
@@ -1052,6 +1070,11 @@ function scaffold(scaffolddir,kwargs::Dict)
         compbumper = CompiledGeometry(joinpath("scripts","bumper.gwl"),bh;laserpower=kwargs[:laserpower],scanspeed=kwargs[:scanspeed])
         #get the coordinates of all the posts and beams
         pc = Toast.postbeamcoords(kwargs[:w],kwargs[:h1],kwargs[:h2],kwargs[:h3],kwargs[:cornerdiff],kwargs[:hexsize])
+
+        #remove hammocks which don't have 6 vertices (i.e. that are incomplete)
+        filter!(pc.hexcoords) do h
+            length(h.verts) == 6
+        end
 
         #I now want to build two dicts, one which tracks whether a post has been written or not
         #and one which maps beams to the corresponding posts
@@ -1233,8 +1256,8 @@ function scaffold(scaffolddir,kwargs::Dict)
                     #return true
                     isempty(thispostcoord) ? true : postdict[thispostcoord[1]]
                 end
-                
-                @show ourhams = filter(pc.hexcoords) do h
+
+                ourhams = filter(pc.hexcoords) do h
                     all(h.verts) do v
                         supportwritten(v)
                     end
@@ -1248,10 +1271,12 @@ function scaffold(scaffolddir,kwargs::Dict)
                 end
                 
                 boundary = findhexboundary(convert(Vector{HexCoords},ourhams))
+                #need to move the boundary to account for the current objective position
+                boundary = [translate(b,-1*kernelcenter) for b in boundary]
                 #start from :hamoffset above the top of the beams
                 thisz = kwargs[:hbottom]+kwargs[:hbeam]+kwargs[:hamoffset]
                 slices = map(1:kwargs[:nhammock]) do _
-                    toreturn = thisz => Tessen.Slice([boundary])
+                    toreturn = thisz => Tessen.Slice(boundary)
                     thisz += kwargs[:dhammockslice]
                     return toreturn
                 end
@@ -1260,17 +1285,20 @@ function scaffold(scaffolddir,kwargs::Dict)
                 @info "hatching kernel $i-$j"
                 hatched = hatch(postbeams,kwargs[:dhatch],0,pi/2)
                 #i think we will always have hammocks to write
-                hamhatched = hatch(floorblock,kwargs[:dhammockhatch],0,pi/2)
                 @info "compiling kernel $i-$j"                
                 #compile
                 cg = CompiledGeometry(joinpath("scripts","kernel_($i-$j).gwl"),hatched;laserpower=kwargs[:laserpower],scanspeed=kwargs[:scanspeed])
-                ch = CompiledGeometry(joinpath("scripts","kernel_($i-$j)_hammocks.gwl"),hamhatched;laserpower=kwargs[:hamlaserpower],scanspeed=kwargs[:hamscanspeed])
                 cg = translate(cg,[kernelcenter...,zero(kernelcenter[1])])
-                ch = translate(ch,[kernelcenter...,zero(kernelcenter[1])])
+                push!(kernels,cg)
                 #ch = translate(ch,[kernelcenter...,zero(kernelcenter[1])])
                 #cg = translate(cg,[(kernelcenter-lastcenter)...,zero(kernelcenter[1])])
+                if !isempty(boundary)
+                    hamhatched = hatch(floorblock,kwargs[:dhammockhatch],1,pi/2)
+                    ch = CompiledGeometry(joinpath("scripts","kernel_($i-$j)_hammocks.gwl"),hamhatched;laserpower=kwargs[:hamlaserpower],scanspeed=kwargs[:hamscanspeed])
+                    ch = translate(ch,[kernelcenter...,zero(kernelcenter[1])])
+                    push!(kernels,ch)
+                end
                 lastcenter=kernelcenter
-                push!(kernels,cg,ch)
             end
             if emptyring
                 #if we didn't find any posts in this ring
