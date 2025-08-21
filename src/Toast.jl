@@ -1065,7 +1065,7 @@ function scaffold(scaffolddir,kwargs::Dict)
                          kwargs[:hbottom]+kwargs[:htop],kwargs[:dslice],kwargs[:overlap],
                          kwargs[:cutangle])
         @info "hatching bumper"
-        bh = hatch(b,kwargs[:dhatch],0,pi/2)
+        bh = hatch(b,kwargs[:dhatch],1,pi/2)
         @info "compiling bumper"
         compbumper = CompiledGeometry(joinpath("scripts","bumper.gwl"),bh;laserpower=kwargs[:laserpower],scanspeed=kwargs[:scanspeed])
         #get the coordinates of all the posts and beams
